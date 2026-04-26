@@ -31,8 +31,7 @@ const GUILD_ID      = process.env.GUILD_ID;
 const CATEGORY_ID   = process.env.CATEGORY_ID;
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
 const NOTIF_CHAN_ID = process.env.NOTIF_CHAN_ID;
-const PORT          = process.env.PORT || 3000;
-
+const PORT = process.env.PORT || 8080;
 // ── SAFETY CHECK ────────────────────────────────────────────
 if (!token) {
   console.error("❌ TOKEN manquant ! Vérifie tes variables d'environnement.");
