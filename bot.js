@@ -19,8 +19,7 @@ const express = require('express');
 const cors = require('cors');
 
 // ── ENV CONFIG ──────────────────────────────────────────────
-const token = process.env.TOKEN;
-
+const token = process.env.token;
 const GUILD_ID      = process.env.GUILD_ID;
 const CATEGORY_ID   = process.env.CATEGORY_ID;
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
