@@ -2,7 +2,6 @@
 // SLIDE STUDIO — Discord Bot (PROD READY)
 // ============================================================
 
-require('dotenv').config();
 
 const {
   Client,
