@@ -20,7 +20,13 @@ const cors = require('cors');
 
 // ── ENV CONFIG ──────────────────────────────────────────────
 const token = process.env.TOKEN;
-console.log("TOKEN exists:", !!token);
+
+console.log("TOKEN exists:", !!process.env.TOKEN);
+
+if (!token) {
+  console.error("❌ TOKEN manquant ! Vérifie tes variables d'environnement.");
+  process.exit(1);
+}
 const GUILD_ID      = process.env.GUILD_ID;
 const CATEGORY_ID   = process.env.CATEGORY_ID;
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
