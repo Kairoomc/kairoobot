@@ -1,44 +1,88 @@
 // ============================================================
-// SLIDE STUDIO — Discord Bot (PROD READY)
+//  SLIDE STUDIO — Discord Bot + Dashboard API + OTP Auth
+//  Lance avec : node bot.js
 // ============================================================
+require('dotenv').config();
 
 const {
-  Client,
-  GatewayIntentBits,
-  PermissionsBitField,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ChannelType,
-  Events
+  Client, GatewayIntentBits, PermissionsBitField,
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder,
+  ButtonStyle, ChannelType, Events
 } = require('discord.js');
-
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
+const fs      = require('fs');
+const path    = require('path');
+const crypto  = require('crypto');
 
-// ── ENV CONFIG ──────────────────────────────────────────────
-const token = process.env.TOKEN;
+// ── CONFIG ────────────────────────────────────────────────
+const TOKEN          = process.env.BOT_TOKEN;
+const GUILD_ID       = process.env.GUILD_ID      || '';
+const CATEGORY_ID    = process.env.CATEGORY_ID   || '';
+const ADMIN_ROLE_ID  = process.env.ADMIN_ROLE_ID  || '';
+const NOTIF_CHAN_ID   = process.env.NOTIF_CHAN_ID  || '';
+const PORT           = process.env.PORT           || 3001;
+const OTP_TTL_MS     = 10 * 60 * 1000;   // code valable 10 min
+const SESSION_TTL_MS = 2  * 60 * 60 * 1000; // session 2h
+const MAX_OTP_TRIES  = 5;                 // tentatives max
+const OTP_COOLDOWN   = 60 * 1000;         // 1 min entre chaque demande
 
-console.log("TOKEN exists:", !!process.env.TOKEN);
+// ── OTP STORE (en mémoire — s'efface au redémarrage) ─────
+// Map : discordTag → { code, expiresAt, tries, lastSentAt }
+const otpStore = new Map();
 
-if (!token) {
-  console.error("TOKEN manquant ! Vérifie tes variables d'environnement.");
-  process.exit(1);
+// ── SESSION STORE (en mémoire) ────────────────────────────
+// Map : token → { discord, expiresAt }
+const sessionStore = new Map();
+
+function generateOTP() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+function cleanExpired() {
+  const now = Date.now();
+  for (const [k, v] of otpStore) {
+    if (v.expiresAt < now) otpStore.delete(k);
+  }
+  for (const [k, v] of sessionStore) {
+    if (v.expiresAt < now) sessionStore.delete(k);
+  }
+}
+// Nettoyage toutes les 5 minutes
+setInterval(cleanExpired, 5 * 60 * 1000);
+
+// ── STOCKAGE COMMANDES (JSON local) ───────────────────────
+const DB_FILE = path.join(__dirname, 'orders.json');
+function loadOrders() {
+  if (!fs.existsSync(DB_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch { return []; }
+}
+function saveOrders(orders) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(orders, null, 2));
+}
+function addOrder(order) {
+  const orders = loadOrders();
+  orders.push(order);
+  saveOrders(orders);
+  return order;
+}
+function updateOrder(id, fields) {
+  const orders = loadOrders();
+  const idx = orders.findIndex(o => o.id === id);
+  if (idx === -1) return null;
+  orders[idx] = { ...orders[idx], ...fields, updatedAt: new Date().toISOString() };
+  saveOrders(orders);
+  return orders[idx];
+}
+function getByDiscord(tag) {
+  return loadOrders().filter(o => o.discord === tag.toLowerCase().trim());
 }
 
-const GUILD_ID      = process.env.GUILD_ID;
-const CATEGORY_ID   = process.env.CATEGORY_ID;
-const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
-const NOTIF_CHAN_ID  = process.env.NOTIF_CHAN_ID;
-const PORT = process.env.PORT || 8080;
-
-// ── PENDING ORDERS (awaiting client DM confirmation) ────────
-// Map<token, { orderData, resolve, reject, timeout }>
-const pendingOrders = new Map();
-
-// ── CLIENT DISCORD ──────────────────────────────────────────
-const client = new Client({
+// ── BOT ───────────────────────────────────────────────────
+const bot = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
@@ -46,319 +90,375 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: ['CHANNEL'], // required to receive DMs
+  partials: ['CHANNEL', 'MESSAGE'],
 });
 
-client.once(Events.ClientReady, () => {
-  console.log(`Bot connecté : ${client.user.tag}`);
+bot.once(Events.ClientReady, () => {
+  console.log(`✅ Bot connecté : ${bot.user.tag}`);
 });
 
-// ── INTERACTION HANDLER ──────────────────────────────────────
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isButton()) return;
+// ── ENVOYER OTP EN MP ─────────────────────────────────────
+async function sendOTP(discordTag) {
+  const guild = await bot.guilds.fetch(GUILD_ID);
+  await guild.members.fetch(); // cache tous les membres
 
-  const { customId, user } = interaction;
-
-  // ── DM CONFIRMATION: client confirms or refuses the order ──
-  if (customId.startsWith('confirm_oui_') || customId.startsWith('confirm_non_')) {
-    const pendingToken = customId.replace('confirm_oui_', '').replace('confirm_non_', '');
-    const pending = pendingOrders.get(pendingToken);
-
-    if (!pending) {
-      return interaction.reply({
-        content: "Cette confirmation a expiré ou n'existe plus.",
-        ephemeral: true,
-      });
-    }
-
-    if (customId.startsWith('confirm_oui_')) {
-      // Disable buttons on the DM message
-      await interaction.update({
-        embeds: interaction.message.embeds,
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId('done_oui')
-              .setLabel('Commande confirmée')
-              .setStyle(ButtonStyle.Success)
-              .setDisabled(true),
-            new ButtonBuilder()
-              .setCustomId('done_non')
-              .setLabel('Refuser')
-              .setStyle(ButtonStyle.Danger)
-              .setDisabled(true),
-          ),
-        ],
-      });
-
-      clearTimeout(pending.timeout);
-      pendingOrders.delete(pendingToken);
-      pending.resolve({ confirmed: true, userId: user.id });
-
-    } else {
-      await interaction.update({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xE74C3C)
-            .setTitle('Commande annulée')
-            .setDescription(
-              "Vous avez refusé la commande. Nous sommes désolés de ne pas avoir pu vous satisfaire. N'hésitez pas à nous recontacter si vous changez d'avis !"
-            ),
-        ],
-        components: [
-          new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-              .setCustomId('done_oui')
-              .setLabel('Accepter')
-              .setStyle(ButtonStyle.Success)
-              .setDisabled(true),
-            new ButtonBuilder()
-              .setCustomId('done_non')
-              .setLabel('Commande refusée')
-              .setStyle(ButtonStyle.Danger)
-              .setDisabled(true),
-          ),
-        ],
-      });
-
-      clearTimeout(pending.timeout);
-      pendingOrders.delete(pendingToken);
-      pending.resolve({ confirmed: false, userId: user.id });
-    }
-
-    return;
-  }
-
-  // ── TICKET BUTTONS (inside order channel) ───────────────────
-  const { channel, member } = interaction;
-
-  if (customId.startsWith('acompte_recu_')) {
-    await interaction.reply({ content: `Acompte validé par <@${member.id}>`, ephemeral: false });
-    await channel.send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x2ECC71)
-          .setTitle('Acompte reçu')
-          .setDescription('Le projet peut commencer.'),
-      ],
-    });
-  }
-
-  if (customId.startsWith('livre_')) {
-    await interaction.reply({ content: 'Commande livrée !', ephemeral: false });
-    const newName = channel.name.startsWith('commande')
-      ? channel.name.replace('commande', 'livre')
-      : `livre-${channel.name}`;
-    await channel.setName(newName);
-  }
-
-  if (customId.startsWith('annuler_')) {
-    await interaction.reply({ content: 'Commande annulée.', ephemeral: false });
-    const newName = channel.name.startsWith('commande')
-      ? channel.name.replace('commande', 'annule')
-      : `annule-${channel.name}`;
-    await channel.setName(newName);
-  }
-});
-
-// ── SEND DM CONFIRMATION TO CLIENT ──────────────────────────
-async function sendDMConfirmation(orderData) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const { name, discord, pack, type, desc } = orderData;
-
-  // Resolve member by username or user ID
-  await guild.members.fetch();
-  const member = guild.members.cache.find(
-    (m) =>
-      m.user.username.toLowerCase() === discord.toLowerCase() ||
-      m.user.tag.toLowerCase() === discord.toLowerCase() ||
-      m.user.id === discord
+  // Chercher le membre par username
+  const member = guild.members.cache.find(m =>
+    m.user.username.toLowerCase() === discordTag.toLowerCase() ||
+    m.user.tag.toLowerCase() === discordTag.toLowerCase() ||
+    (m.nickname && m.nickname.toLowerCase() === discordTag.toLowerCase())
   );
 
-  if (!member) {
-    throw new Error(`Membre Discord introuvable : ${discord}`);
-  }
+  if (!member) return { success: false, error: 'not_found' };
 
-  const pendingToken = `${member.id}_${Date.now()}`;
-
-  const dmEmbed = new EmbedBuilder()
-    .setColor(0xE8642A)
-    .setTitle('Nouvelle commande — Slide Studio')
-    .setDescription(
-      "Bonjour ! Une commande a été passée en votre nom. Veuillez confirmer ou refuser ci-dessous."
-    )
-    .addFields(
-      { name: 'Nom', value: name, inline: true },
-      { name: 'Pack', value: pack, inline: true },
-      { name: 'Type', value: type, inline: true },
-      { name: 'Description', value: desc },
-    )
-    .setTimestamp()
-    .setFooter({ text: 'Cette confirmation expire dans 30 minutes.' });
-
-  const dmRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`confirm_oui_${pendingToken}`)
-      .setLabel('Oui, je confirme')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`confirm_non_${pendingToken}`)
-      .setLabel('Non, annuler')
-      .setStyle(ButtonStyle.Danger),
-  );
-
-  await member.send({ embeds: [dmEmbed], components: [dmRow] });
-
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      pendingOrders.delete(pendingToken);
-      reject(new Error('DM confirmation timeout (30 min)'));
-    }, 30 * 60 * 1000);
-
-    pendingOrders.set(pendingToken, { orderData, userId: member.id, resolve, reject, timeout });
+  const code = generateOTP();
+  otpStore.set(discordTag.toLowerCase(), {
+    code,
+    expiresAt: Date.now() + OTP_TTL_MS,
+    tries: 0,
+    lastSentAt: Date.now(),
+    userId: member.user.id,
   });
+
+  try {
+    const dm = await member.user.createDM();
+    await dm.send({
+      embeds: [new EmbedBuilder()
+        .setColor(0xA855F7)
+        .setTitle('🔐 Ton code de connexion — Slide Studio')
+        .setDescription(
+          `Voici ton code pour accéder à ton dashboard :\n\n` +
+          `# \`${code}\`\n\n` +
+          `⏱ **Valable 10 minutes** · Ne le partage à personne.\n\n` +
+          `Si tu n'as pas demandé ce code, ignore ce message.`
+        )
+        .setFooter({ text: 'Slide Studio · Dashboard Client' })
+        .setTimestamp()
+      ]
+    });
+    return { success: true };
+  } catch (err) {
+    // L'utilisateur a peut-être bloqué les MPs
+    otpStore.delete(discordTag.toLowerCase());
+    return { success: false, error: 'dm_blocked' };
+  }
 }
 
-// ── CREATE ORDER CHANNEL ─────────────────────────────────────
-async function createOrderChannel(orderData, userId) {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const { name, discord, pack, type, desc } = orderData;
+// ── INTERACTIONS (boutons admin) ──────────────────────────
+bot.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+  const { customId, channel, member } = interaction;
 
-  const safeName = discord
-    .toLowerCase()
-    .replace(/[^a-z0-9\-_]/g, '-')
-    .substring(0, 30);
+  const sep     = customId.indexOf('_');
+  const action  = customId.slice(0, sep);
+  const orderId = customId.slice(sep + 1);
 
-  const permissionOverwrites = [
-    {
-      id: guild.roles.everyone,
-      deny: [PermissionsBitField.Flags.ViewChannel],
-    },
-    // Grant access to the client
-    {
-      id: userId,
-      allow: [
-        PermissionsBitField.Flags.ViewChannel,
-        PermissionsBitField.Flags.SendMessages,
-        PermissionsBitField.Flags.ReadMessageHistory,
-      ],
-    },
-  ];
+  const statusMap = {
+    acompte:    { status: 'Acompte reçu',  acomptePaid: true },
+    production: { status: 'En production' },
+    revision:   { status: 'En révision'   },
+    livre:      { status: 'Livré', deliveredAt: new Date().toISOString() },
+    annuler:    { status: 'Annulé' },
+  };
 
-  if (ADMIN_ROLE_ID) {
-    permissionOverwrites.push({
-      id: ADMIN_ROLE_ID,
-      allow: [
-        PermissionsBitField.Flags.ViewChannel,
-        PermissionsBitField.Flags.SendMessages,
-        PermissionsBitField.Flags.ReadMessageHistory,
-        PermissionsBitField.Flags.ManageMessages,
-      ],
+  const upd = statusMap[action];
+  if (!upd) return;
+
+  const order = updateOrder(orderId, upd);
+
+  const labels = {
+    acompte:    '💰 Acompte confirmé — production peut démarrer !',
+    production: '🎬 Statut : En production',
+    revision:   '🔄 Statut : En révision',
+    livre:      '✅ Vidéo livrée !',
+    annuler:    '❌ Commande annulée.',
+  };
+
+  await interaction.reply({
+    content: `${labels[action]} _(par <@${member.id}>)_`,
+    ephemeral: false,
+  });
+
+  if (action === 'livre')   try { await channel.setName('✅-' + channel.name.replace(/^[^-]+-/, '')); } catch {}
+  if (action === 'annuler') try { await channel.setName('❌-' + channel.name.replace(/^[^-]+-/, '')); } catch {}
+
+  if (action === 'livre' && order) {
+    await channel.send({
+      embeds: [new EmbedBuilder()
+        .setColor(0x34D399)
+        .setTitle('🎉 Ta vidéo est prête !')
+        .setDescription(
+          `Salut **${order.name}** !\n\n` +
+          `Ton montage est terminé 🎬\n` +
+          `📥 Télécharge ta vidéo via le lien ci-dessus.\n\n` +
+          `📊 Retrouve ta commande sur ton dashboard : **slidestudio.fr/dashboard**\n\n` +
+          `⭐ Un avis sur notre Discord nous ferait vraiment plaisir !\nMerci 🙏`
+        )
+        .setTimestamp()
+      ]
     });
   }
 
-  const channel = await guild.channels.create({
+  if (action === 'acompte') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`production_${orderId}`).setLabel('🎬 En production').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`revision_${orderId}`).setLabel('🔄 En révision').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`livre_${orderId}`).setLabel('✅ Livrer').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`annuler_${orderId}`).setLabel('❌ Annuler').setStyle(ButtonStyle.Danger),
+    );
+    await channel.send({ content: '**Avancement :**', components: [row] });
+  }
+});
+
+// ── CRÉER SALON COMMANDE ──────────────────────────────────
+async function createOrderChannel(order) {
+  const guild = await bot.guilds.fetch(GUILD_ID);
+  const { id, name, discord, pack, type, desc, timestamp } = order;
+
+  const safeName = discord.replace(/[^a-z0-9\-_]/g, '-').substring(0, 28);
+  const chOpts = {
     name: `commande-${safeName}`,
     type: ChannelType.GuildText,
-    topic: `Commande de ${name} (${discord})`,
-    parent: CATEGORY_ID || null,
-    permissionOverwrites,
+    topic: `${name} (${discord}) — ${pack} | ID: ${id}`,
+    permissionOverwrites: [
+      { id: guild.roles.everyone, deny: [PermissionsBitField.Flags.ViewChannel] },
+    ],
+  };
+  if (CATEGORY_ID) chOpts.parent = CATEGORY_ID;
+  if (ADMIN_ROLE_ID) chOpts.permissionOverwrites.push({
+    id: ADMIN_ROLE_ID,
+    allow: [
+      PermissionsBitField.Flags.ViewChannel,
+      PermissionsBitField.Flags.SendMessages,
+      PermissionsBitField.Flags.ReadMessageHistory,
+    ],
   });
 
+  const ch = await guild.channels.create(chOpts);
+  updateOrder(id, { channelId: ch.id });
+
   const embed = new EmbedBuilder()
-    .setColor(0xE8642A)
-    .setTitle('Nouvelle commande')
+    .setColor(0xA855F7)
+    .setTitle('🎬 Nouvelle commande !')
     .addFields(
-      { name: 'Client', value: name, inline: true },
-      { name: 'Discord', value: `<@${userId}>`, inline: true },
-      { name: 'Pack', value: pack, inline: false },
-      { name: 'Type', value: type, inline: true },
-      { name: 'Description', value: desc },
+      { name: '👤 Client',      value: `**${name}**`,    inline: true },
+      { name: '💬 Discord',     value: `\`${discord}\``, inline: true },
+      { name: '🆔 ID',          value: `\`${id}\``,      inline: true },
+      { name: '📦 Pack',        value: `**${pack}**`,    inline: true },
+      { name: '🎥 Type',        value: type,             inline: true },
+      { name: '📝 Description', value: desc && desc !== 'Non renseigné' ? desc.slice(0,1000) : '_Non renseigné_', inline: false },
     )
+    .setFooter({ text: `Reçue le ${timestamp}` })
     .setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`acompte_recu_${safeName}`)
-      .setLabel('Acompte reçu')
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId(`livre_${safeName}`)
-      .setLabel('Livré')
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId(`annuler_${safeName}`)
-      .setLabel('Annuler')
-      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`acompte_${id}`).setLabel('💰 Acompte reçu').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`annuler_${id}`).setLabel('❌ Annuler').setStyle(ButtonStyle.Danger),
   );
 
-  const pingContent = [
-    ADMIN_ROLE_ID ? `<@&${ADMIN_ROLE_ID}>` : null,
-    `<@${userId}>`,
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  await channel.send({
-    content: `${pingContent} — nouvelle commande confirmée !`,
+  await ch.send({
+    content: ADMIN_ROLE_ID ? `<@&${ADMIN_ROLE_ID}> — Nouvelle commande !` : '🔔 Nouvelle commande !',
     embeds: [embed],
     components: [row],
   });
 
-  return { channelId: channel.id };
+  await ch.send({
+    embeds: [new EmbedBuilder()
+      .setColor(0x38BDF8)
+      .setTitle(`👋 Bienvenue ${name} !`)
+      .setDescription(
+        `Ton salon de commande est créé ✨\n\n` +
+        `📋 **Étapes :**\n` +
+        `1. On te contacte sous **24h**\n` +
+        `2. Validation du brief\n` +
+        `3. Acompte 50% pour démarrer\n` +
+        `4. Production & livraison sous **48h**\n\n` +
+        `📊 **Suis ta commande :** **slidestudio.fr/dashboard**\n` +
+        `→ Connecte-toi avec ton tag Discord \`${discord}\` + code reçu en MP\n\n` +
+        `💬 Écris ici pour toute question.`
+      )
+      .setTimestamp()
+    ]
+  });
+
+  if (NOTIF_CHAN_ID) {
+    try {
+      const notifCh = guild.channels.cache.get(NOTIF_CHAN_ID);
+      if (notifCh) await notifCh.send({
+        embeds: [new EmbedBuilder()
+          .setColor(0xA855F7)
+          .setDescription(`📥 Nouvelle commande de **${name}** (${discord}) — ${pack}\n👉 <#${ch.id}>`)
+          .setTimestamp()
+        ]
+      });
+    } catch {}
+  }
+
+  return { channelId: ch.id, channelName: ch.name };
 }
 
-// ── EXPRESS API ──────────────────────────────────────────────
+// ── EXPRESS API ───────────────────────────────────────────
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.post('/commande', async (req, res) => {
+// ─── Middleware vérification session ─────────────────────
+function requireSession(req, res, next) {
+  const token = req.headers['x-session-token'];
+  if (!token) return res.status(401).json({ error: 'Non authentifié' });
+
+  const session = sessionStore.get(token);
+  if (!session) return res.status(401).json({ error: 'Session invalide ou expirée' });
+  if (session.expiresAt < Date.now()) {
+    sessionStore.delete(token);
+    return res.status(401).json({ error: 'Session expirée', expired: true });
+  }
+
+  req.sessionDiscord = session.discord;
+  next();
+}
+
+// ─── POST /auth/request — demander un code OTP ───────────
+app.post('/auth/request', async (req, res) => {
   try {
-    const { name, discord, pack, type, desc } = req.body;
-
-    if (!name || !discord || !pack || !type || !desc) {
-      return res.status(400).json({ error: 'Champs manquants' });
+    const { discord } = req.body;
+    if (!discord || discord.trim().length < 2) {
+      return res.status(400).json({ error: 'Tag Discord invalide' });
     }
 
-    const orderData = {
-      name,
-      discord,
-      pack,
-      type,
-      desc,
-      timestamp: new Date().toLocaleString('fr-FR'),
-    };
+    const tag = discord.toLowerCase().trim();
 
-    // Step 1 — send DM to client and wait for confirmation
-    let confirmation;
-    try {
-      confirmation = await sendDMConfirmation(orderData);
-    } catch (dmErr) {
-      console.error('DM error:', dmErr.message);
-      return res.status(422).json({ error: dmErr.message });
+    // Vérifier cooldown
+    const existing = otpStore.get(tag);
+    if (existing && (Date.now() - existing.lastSentAt) < OTP_COOLDOWN) {
+      const wait = Math.ceil((OTP_COOLDOWN - (Date.now() - existing.lastSentAt)) / 1000);
+      return res.status(429).json({ error: `Attends ${wait}s avant de redemander un code.`, wait });
     }
 
-    if (!confirmation.confirmed) {
-      return res.status(200).json({ success: false, reason: 'client_refused' });
+    // Vérifier que le tag a au moins une commande
+    const orders = getByDiscord(tag);
+    if (orders.length === 0) {
+      return res.status(404).json({ error: 'no_orders', message: 'Aucune commande trouvée pour ce tag Discord.' });
     }
 
-    // Step 2 — create the ticket channel and add the client
-    const result = await createOrderChannel(orderData, confirmation.userId);
+    const result = await sendOTP(tag);
 
-    res.json({ success: true, ...result });
+    if (!result.success) {
+      if (result.error === 'not_found') {
+        return res.status(404).json({ error: 'discord_not_found', message: 'Tag Discord introuvable sur notre serveur. Rejoins-le d\'abord !' });
+      }
+      if (result.error === 'dm_blocked') {
+        return res.status(400).json({ error: 'dm_blocked', message: 'Impossible d\'envoyer un MP. Active les MPs privés dans Discord.' });
+      }
+    }
 
+    res.json({ success: true, message: 'Code envoyé en MP Discord !' });
   } catch (err) {
-    console.error(err);
+    console.error('Erreur /auth/request:', err);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok' }));
+// ─── POST /auth/verify — vérifier le code OTP ────────────
+app.post('/auth/verify', (req, res) => {
+  const { discord, code } = req.body;
+  if (!discord || !code) return res.status(400).json({ error: 'Champs manquants' });
 
-app.listen(PORT, () => {
-  console.log(`API sur port ${PORT}`);
+  const tag = discord.toLowerCase().trim();
+  const otp = otpStore.get(tag);
+
+  if (!otp) {
+    return res.status(400).json({ error: 'no_otp', message: 'Aucun code en attente. Redemande un code.' });
+  }
+  if (otp.expiresAt < Date.now()) {
+    otpStore.delete(tag);
+    return res.status(400).json({ error: 'expired', message: 'Code expiré. Redemande un nouveau code.' });
+  }
+
+  otp.tries++;
+  if (otp.tries > MAX_OTP_TRIES) {
+    otpStore.delete(tag);
+    return res.status(400).json({ error: 'too_many', message: 'Trop de tentatives. Redemande un nouveau code.' });
+  }
+
+  if (otp.code !== String(code).trim()) {
+    const left = MAX_OTP_TRIES - otp.tries;
+    return res.status(400).json({ error: 'wrong_code', message: `Code incorrect. ${left} tentative${left > 1 ? 's' : ''} restante${left > 1 ? 's' : ''}.` });
+  }
+
+  // ✅ Code correct — créer la session
+  otpStore.delete(tag);
+  const token = generateSessionToken();
+  sessionStore.set(token, {
+    discord: tag,
+    expiresAt: Date.now() + SESSION_TTL_MS,
+    createdAt: Date.now(),
+  });
+
+  res.json({ success: true, token, expiresIn: SESSION_TTL_MS });
 });
 
-// ── LOGIN DISCORD ────────────────────────────────────────────
-client.login(token);
+// ─── POST /commande ───────────────────────────────────────
+app.post('/commande', async (req, res) => {
+  try {
+    const { name, discord, pack, type, desc } = req.body;
+    if (!name || !discord || !pack || !type) {
+      return res.status(400).json({ error: 'Champs manquants' });
+    }
+
+    const now = new Date();
+    const timestamp = now.toLocaleDateString('fr-FR') + ' à ' + now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    const id = 'SS-' + Date.now().toString(36).toUpperCase();
+
+    const order = addOrder({
+      id, name,
+      discord: discord.toLowerCase().trim(),
+      pack, type,
+      desc: desc || 'Non renseigné',
+      status: 'En attente',
+      timestamp,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString(),
+      acomptePaid: false,
+      soldePaid: false,
+      channelId: null,
+      deliveryLink: null,
+      deliveredAt: null,
+    });
+
+    const result = await createOrderChannel(order);
+    res.json({ success: true, orderId: id, ...result });
+  } catch (err) {
+    console.error('Erreur /commande:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ─── GET /dashboard — commandes du client authentifié ────
+app.get('/dashboard', requireSession, (req, res) => {
+  const tag = req.sessionDiscord;
+  const orders = getByDiscord(tag);
+
+  const safe = orders.map(o => ({
+    id:          o.id,
+    pack:        o.pack,
+    type:        o.type,
+    status:      o.status,
+    timestamp:   o.timestamp,
+    createdAt:   o.createdAt,
+    updatedAt:   o.updatedAt,
+    acomptePaid: o.acomptePaid,
+    soldePaid:   o.soldePaid,
+    deliveryLink:o.deliveryLink || null,
+    deliveredAt: o.deliveredAt || null,
+    desc:        o.desc,
+  }));
+
+  res.json({ discord: tag, orders: safe, total: safe.length });
+});
+
+// ─── GET /health ──────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, () => console.log(`🌐 API sur port ${PORT}`));
+bot.login(TOKEN);
